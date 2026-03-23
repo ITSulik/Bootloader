@@ -8,6 +8,14 @@
 #define GPT_ENTRY_SIZE 128u
 #define GPT_ENTRY_COUNT_PER_SECTOR 4u
 #define GPT_ENTRY_DISPLAY_COUNT 2u
+#define EXT_INCOMPAT_FILETYPE 0x0002u
+#define EXT_INCOMPAT_META_BG 0x0010u
+#define EXT_INCOMPAT_EXTENTS 0x0040u
+#define EXT_INCOMPAT_64BIT 0x0080u
+#define EXT_INCOMPAT_FLEX_BG 0x0200u
+#define EXT_INCOMPAT_INLINE_DATA 0x8000u
+#define EXT_INCOMPAT_ENCRYPT 0x10000u
+#define EXT_INCOMPAT_CASEFOLD 0x20000u
 
 typedef struct MbrPartitionEntry {
     u8 boot_indicator;
@@ -44,6 +52,16 @@ typedef struct BootPlan {
     TargetCandidate candidate;
     int ready;
 } BootPlan;
+
+typedef enum VbrKind {
+    VBR_KIND_UNREAD = 0,
+    VBR_KIND_NTFS,
+    VBR_KIND_FAT,
+    VBR_KIND_EXFAT,
+    VBR_KIND_GENERIC_BOOT,
+    VBR_KIND_DATA,
+    VBR_KIND_UNKNOWN
+} VbrKind;
 
 static const u8 EFI_SYSTEM_GUID[16] = {
     0x28u, 0x73u, 0x2Au, 0xC1u, 0x1Fu, 0xF8u, 0xD2u, 0x11u,
@@ -140,6 +158,346 @@ static int bytes_are_zero(const u8 *bytes, u32 length) {
     }
 
     return 1;
+}
+
+static int sector_has_jump_opcode(const u8 *sector) {
+    return sector[0] == 0xEBu || sector[0] == 0xE9u;
+}
+
+static VbrKind detect_vbr_kind(const u8 *sector) {
+    u16 signature;
+
+    signature = read_le_u16(sector + 510u);
+
+    if (signature != 0xAA55u) {
+        if (bytes_are_zero(sector, 64u)) {
+            return VBR_KIND_DATA;
+        }
+
+        return VBR_KIND_UNKNOWN;
+    }
+
+    if (bytes_match(sector + 3u, (const u8 *)"NTFS    ", 8u)) {
+        return VBR_KIND_NTFS;
+    }
+
+    if (bytes_match(sector + 3u, (const u8 *)"EXFAT   ", 8u)) {
+        return VBR_KIND_EXFAT;
+    }
+
+    if (bytes_match(sector + 3u, (const u8 *)"MSDOS5.0", 8u) ||
+        bytes_match(sector + 3u, (const u8 *)"MSWIN4.1", 8u) ||
+        bytes_match(sector + 3u, (const u8 *)"mkfs.fat", 8u) ||
+        bytes_match(sector + 3u, (const u8 *)"FRDOS5.1", 8u)) {
+        return VBR_KIND_FAT;
+    }
+
+    if (sector_has_jump_opcode(sector)) {
+        return VBR_KIND_GENERIC_BOOT;
+    }
+
+    return VBR_KIND_UNKNOWN;
+}
+
+static const char *vbr_kind_label(VbrKind kind) {
+    if (kind == VBR_KIND_NTFS) {
+        return "NTFS VBR";
+    }
+
+    if (kind == VBR_KIND_FAT) {
+        return "FAT VBR";
+    }
+
+    if (kind == VBR_KIND_EXFAT) {
+        return "exFAT VBR";
+    }
+
+    if (kind == VBR_KIND_GENERIC_BOOT) {
+        return "generic boot";
+    }
+
+    if (kind == VBR_KIND_DATA) {
+        return "plain data";
+    }
+
+    if (kind == VBR_KIND_UNREAD) {
+        return "not read";
+    }
+
+    return "unknown VBR";
+}
+
+static int linux_layout_probe_is_available(const BootInfo *boot_info) {
+    return (boot_info->inspection_flags & BOOT_INFO_FLAG_LINUX_LAYOUT_VALID) != 0u;
+}
+
+static int linux_ext_superblock_is_valid(const BootInfo *boot_info) {
+    const u8 *probe_sector;
+
+    if (!linux_layout_probe_is_available(boot_info)) {
+        return 0;
+    }
+
+    probe_sector = (const u8 *)GPT_ENTRY_SECTOR_ADDR;
+    return read_le_u16(probe_sector + 56u) == 0xEF53u;
+}
+
+static u32 linux_ext_block_size(const BootInfo *boot_info) {
+    const u8 *probe_sector;
+    u32 log_block_size;
+
+    if (!linux_ext_superblock_is_valid(boot_info)) {
+        return 0u;
+    }
+
+    probe_sector = (const u8 *)GPT_ENTRY_SECTOR_ADDR;
+    log_block_size = read_le_u32(probe_sector + 24u);
+    if (log_block_size > 4u) {
+        return 0u;
+    }
+
+    return 1024u << log_block_size;
+}
+
+static u32 linux_ext_inode_size(const BootInfo *boot_info) {
+    const u8 *probe_sector;
+    u32 inode_size;
+
+    if (!linux_ext_superblock_is_valid(boot_info)) {
+        return 0u;
+    }
+
+    probe_sector = (const u8 *)GPT_ENTRY_SECTOR_ADDR;
+    inode_size = read_le_u16(probe_sector + 88u);
+    if (inode_size == 0u) {
+        return 128u;
+    }
+
+    return inode_size;
+}
+
+static u32 linux_ext_blocks_per_group(const BootInfo *boot_info) {
+    if (!linux_ext_superblock_is_valid(boot_info)) {
+        return 0u;
+    }
+
+    return read_le_u32((const u8 *)GPT_ENTRY_SECTOR_ADDR + 32u);
+}
+
+static u32 linux_ext_inodes_per_group(const BootInfo *boot_info) {
+    if (!linux_ext_superblock_is_valid(boot_info)) {
+        return 0u;
+    }
+
+    return read_le_u32((const u8 *)GPT_ENTRY_SECTOR_ADDR + 40u);
+}
+
+static u32 linux_ext_revision(const BootInfo *boot_info) {
+    if (!linux_ext_superblock_is_valid(boot_info)) {
+        return 0u;
+    }
+
+    return read_le_u32((const u8 *)GPT_ENTRY_SECTOR_ADDR + 76u);
+}
+
+static u32 linux_ext_incompat_features(const BootInfo *boot_info) {
+    if (!linux_ext_superblock_is_valid(boot_info)) {
+        return 0u;
+    }
+
+    return read_le_u32((const u8 *)GPT_ENTRY_SECTOR_ADDR + 96u);
+}
+
+static u32 linux_ext_first_data_block(const BootInfo *boot_info) {
+    if (!linux_ext_superblock_is_valid(boot_info)) {
+        return 0u;
+    }
+
+    return read_le_u32((const u8 *)GPT_ENTRY_SECTOR_ADDR + 20u);
+}
+
+static u32 linux_ext_gdt_lba(const BootPlan *boot_plan, const BootInfo *boot_info) {
+    u32 block_size;
+    u32 gdt_block;
+
+    if (!linux_ext_superblock_is_valid(boot_info)) {
+        return 0u;
+    }
+
+    block_size = linux_ext_block_size(boot_info);
+    if (block_size == 0u) {
+        return 0u;
+    }
+
+    gdt_block = (block_size == 1024u) ? 2u : 1u;
+    return boot_plan->candidate.first_lba + (gdt_block * (block_size / 512u));
+}
+
+static int linux_ext_gdt_probe_is_available(const BootInfo *boot_info) {
+    u32 block_size;
+
+    if (!linux_ext_superblock_is_valid(boot_info)) {
+        return 0;
+    }
+
+    block_size = linux_ext_block_size(boot_info);
+    return block_size == 1024u || block_size == 2048u;
+}
+
+static u32 linux_ext_group_desc_field(const BootInfo *boot_info, u32 offset) {
+    if (!linux_ext_gdt_probe_is_available(boot_info)) {
+        return 0u;
+    }
+
+    return read_le_u32((const u8 *)GPT_HEADER_ADDR + offset);
+}
+
+static u32 linux_ext_block_to_lba(const BootPlan *boot_plan,
+                                  const BootInfo *boot_info,
+                                  u32 filesystem_block) {
+    u32 sectors_per_block;
+    u32 block_size;
+
+    block_size = linux_ext_block_size(boot_info);
+    if (block_size == 0u) {
+        return 0u;
+    }
+
+    sectors_per_block = block_size / 512u;
+    return boot_plan->candidate.first_lba + filesystem_block * sectors_per_block;
+}
+
+static u32 linux_ext_root_inode_lba(const BootPlan *boot_plan,
+                                    const BootInfo *boot_info) {
+    u32 inode_table_block;
+    u32 inode_size;
+
+    inode_table_block = linux_ext_group_desc_field(boot_info, 8u);
+    inode_size = linux_ext_inode_size(boot_info);
+    if (inode_table_block == 0u || inode_size == 0u) {
+        return 0u;
+    }
+
+    return linux_ext_block_to_lba(boot_plan, boot_info, inode_table_block) +
+           (inode_size / 512u);
+}
+
+static u32 linux_ext_root_inode_offset(const BootInfo *boot_info) {
+    u32 inode_size;
+
+    inode_size = linux_ext_inode_size(boot_info);
+    if (inode_size == 0u) {
+        return 0u;
+    }
+
+    return inode_size % 512u;
+}
+
+static void write_trimmed_ascii(u32 row,
+                                u32 column,
+                                u8 color,
+                                const u8 *bytes,
+                                u32 max_length) {
+    u32 length;
+    u32 index;
+
+    length = 0u;
+    while (length < max_length && bytes[length] != 0u) {
+        ++length;
+    }
+
+    while (length > 0u && bytes[length - 1u] == ' ') {
+        --length;
+    }
+
+    if (length == 0u) {
+        write_string(row, column, color, "(empty)");
+        return;
+    }
+
+    for (index = 0u; index < length; ++index) {
+        VGA_TEXT_BUFFER[row * VGA_COLUMNS + column + index] =
+            make_vga_cell((char)bytes[index], color);
+    }
+}
+
+static const char *linux_ext_support_label(const BootInfo *boot_info) {
+    u32 incompat_features;
+
+    incompat_features = linux_ext_incompat_features(boot_info);
+    if (incompat_features == 0u || incompat_features == EXT_INCOMPAT_FILETYPE) {
+        return "simple ext2/3 path";
+    }
+
+    if ((incompat_features & EXT_INCOMPAT_EXTENTS) != 0u) {
+        return "needs extents support";
+    }
+
+    if ((incompat_features & EXT_INCOMPAT_64BIT) != 0u) {
+        return "needs 64-bit ext support";
+    }
+
+    if ((incompat_features & EXT_INCOMPAT_INLINE_DATA) != 0u) {
+        return "needs inline-data support";
+    }
+
+    if ((incompat_features & EXT_INCOMPAT_ENCRYPT) != 0u) {
+        return "encrypted fs unsupported";
+    }
+
+    if ((incompat_features & EXT_INCOMPAT_CASEFOLD) != 0u) {
+        return "needs casefold support";
+    }
+
+    if ((incompat_features & EXT_INCOMPAT_META_BG) != 0u) {
+        return "needs meta_bg support";
+    }
+
+    if ((incompat_features & EXT_INCOMPAT_FLEX_BG) != 0u) {
+        return "needs flex_bg support";
+    }
+
+    return "needs more ext feature checks";
+}
+
+static const char *linux_ext_next_action(const BootInfo *boot_info,
+                                         int gdt_probe_available) {
+    u32 incompat_features;
+
+    incompat_features = linux_ext_incompat_features(boot_info);
+    if ((incompat_features & EXT_INCOMPAT_EXTENTS) != 0u) {
+        return "add extents inode reader";
+    }
+
+    if ((incompat_features & EXT_INCOMPAT_64BIT) != 0u) {
+        return "add 64-bit ext support";
+    }
+
+    if ((incompat_features & EXT_INCOMPAT_INLINE_DATA) != 0u) {
+        return "add inline-data support";
+    }
+
+    if ((incompat_features & EXT_INCOMPAT_ENCRYPT) != 0u) {
+        return "encrypted Linux path blocked";
+    }
+
+    if ((incompat_features & EXT_INCOMPAT_CASEFOLD) != 0u) {
+        return "add casefold support";
+    }
+
+    if ((incompat_features & EXT_INCOMPAT_META_BG) != 0u) {
+        return "add meta_bg support";
+    }
+
+    if ((incompat_features & EXT_INCOMPAT_FLEX_BG) != 0u) {
+        return "add flex_bg support";
+    }
+
+    if (gdt_probe_available) {
+        return "read root inode";
+    }
+
+    return "read ext group descriptors";
 }
 
 static int boot_info_is_valid(const BootInfo *boot_info) {
@@ -369,11 +727,142 @@ static int boot_plan_uses_mbr_path(const BootPlan *boot_plan) {
            bytes_match((const u8 *)boot_plan->candidate.origin, (const u8 *)"MBR", 3u);
 }
 
+static const MbrPartitionEntry *selected_mbr_entry(const BootInfo *boot_info,
+                                                   const BootPlan *boot_plan) {
+    const u8 *mbr;
+
+    if (!boot_plan_uses_mbr_path(boot_plan)) {
+        return 0;
+    }
+
+    if ((boot_info->inspection_flags & BOOT_INFO_FLAG_MBR_VALID) == 0u) {
+        return 0;
+    }
+
+    if (boot_plan->candidate.partition_number >= 4u) {
+        return 0;
+    }
+
+    mbr = (const u8 *)MBR_SECTOR_ADDR;
+    return (const MbrPartitionEntry *)(mbr + PARTITION_ENTRY_OFFSET +
+                                       boot_plan->candidate.partition_number *
+                                           PARTITION_ENTRY_SIZE);
+}
+
+static const char *partition_vbr_fit_label(u8 partition_type, VbrKind kind) {
+    if (partition_type == 0x07u) {
+        if (kind == VBR_KIND_NTFS || kind == VBR_KIND_EXFAT) {
+            return "0x07 matches Windows-style VBR";
+        }
+        if (kind == VBR_KIND_FAT) {
+            return "0x07 type but FAT-like VBR";
+        }
+        if (kind == VBR_KIND_GENERIC_BOOT) {
+            return "0x07 type with custom boot code";
+        }
+        if (kind == VBR_KIND_DATA) {
+            return "0x07 data partition, no VBR";
+        }
+        return "0x07 type but VBR is unclear";
+    }
+
+    if (partition_type == 0x0Bu || partition_type == 0x0Cu) {
+        if (kind == VBR_KIND_FAT) {
+            return "FAT type matches FAT VBR";
+        }
+        if (kind == VBR_KIND_EXFAT) {
+            return "FAT type but exFAT-style VBR";
+        }
+        if (kind == VBR_KIND_NTFS) {
+            return "FAT type but NTFS-style VBR";
+        }
+        if (kind == VBR_KIND_GENERIC_BOOT) {
+            return "FAT type with custom boot code";
+        }
+        if (kind == VBR_KIND_DATA) {
+            return "FAT type but no boot sector";
+        }
+        return "FAT type with unclear VBR";
+    }
+
+    if (partition_type == 0x83u) {
+        if (kind == VBR_KIND_DATA) {
+            return "Linux data partition, not legacy VBR";
+        }
+        if (kind == VBR_KIND_GENERIC_BOOT) {
+            return "Linux partition has custom boot code";
+        }
+        if (kind == VBR_KIND_FAT || kind == VBR_KIND_NTFS || kind == VBR_KIND_EXFAT) {
+            return "0x83 type but VBR says other FS";
+        }
+        if (kind == VBR_KIND_UNKNOWN) {
+            return "Linux partition with unusual first sector";
+        }
+        return "Linux partition without classic VBR";
+    }
+
+    if (kind == VBR_KIND_DATA) {
+        return "partition starts like plain data";
+    }
+
+    if (kind == VBR_KIND_GENERIC_BOOT) {
+        return "partition has bootable custom code";
+    }
+
+    if (kind == VBR_KIND_UNKNOWN) {
+        return "partition type and VBR are unclear";
+    }
+
+    return "partition type and VBR both visible";
+}
+
+static void refine_boot_plan_with_linux_probe(const BootInfo *boot_info,
+                                              BootPlan *boot_plan) {
+    VbrKind kind;
+
+    if (!boot_plan_uses_mbr_path(boot_plan)) {
+        return;
+    }
+
+    if (!bytes_match((const u8 *)boot_plan->request_label, (const u8 *)"Linux", 5u)) {
+        return;
+    }
+
+    if (!linux_layout_probe_is_available(boot_info)) {
+        return;
+    }
+
+    if (linux_ext_superblock_is_valid(boot_info)) {
+        if (linux_ext_gdt_probe_is_available(boot_info)) {
+            boot_plan->status_label = "ext group desc read";
+        } else {
+            boot_plan->status_label = "ext filesystem found";
+        }
+        boot_plan->action_label = linux_ext_next_action(
+            boot_info, linux_ext_gdt_probe_is_available(boot_info));
+        boot_plan->support_label = linux_ext_support_label(boot_info);
+        return;
+    }
+
+    kind = detect_vbr_kind((const u8 *)CHAINLOAD_BUFFER_ADDR);
+    if (kind == VBR_KIND_GENERIC_BOOT) {
+        boot_plan->status_label = "custom Linux boot code";
+        boot_plan->action_label = "legacy chainload path";
+        boot_plan->support_label = "BIOS path exists";
+        return;
+    }
+
+    boot_plan->status_label = "Linux layout unclear";
+    boot_plan->action_label = "inspect more Linux sectors";
+    boot_plan->support_label = "needs extra disk logic";
+}
+
 static void write_target_vbr_line(u32 row,
                                   const BootInfo *boot_info,
                                   const BootPlan *boot_plan) {
     const u8 *target_sector;
     u16 signature;
+    VbrKind kind;
 
     write_string(row, 4u, 0x1F, "Target VBR:");
 
@@ -394,6 +883,7 @@ static void write_target_vbr_line(u32 row,
 
     target_sector = (const u8 *)CHAINLOAD_BUFFER_ADDR;
     signature = read_le_u16(target_sector + 510u);
+    kind = detect_vbr_kind(target_sector);
 
     write_string(row, 16u, 0x1E, "sig 0x");
     write_hex_byte(row, 22u, 0x1E, (u8)(signature >> 8));
@@ -406,22 +896,45 @@ static void write_target_vbr_line(u32 row,
     } else {
         write_string(row, 36u, 0x4F, "missing 0xAA55");
     }
+
+    write_string(row, 52u, 0x1E, vbr_kind_label(kind));
 }
 
 static void write_fallback_reason_line(u32 row,
                                        const BootInfo *boot_info,
                                        const BootPlan *boot_plan) {
+    const MbrPartitionEntry *entry;
+    const u8 *target_sector;
+    VbrKind kind;
+
     write_string(row, 4u, 0x1F, "Fallback:");
 
     if (boot_plan_uses_mbr_path(boot_plan)) {
+        entry = selected_mbr_entry(boot_info, boot_plan);
+
         if ((boot_info->inspection_flags & BOOT_INFO_FLAG_CHAINLOAD_MATCH) == 0u) {
             write_string(row, 16u, 0x4F, "no MBR target matched the key");
         } else if ((boot_info->inspection_flags & BOOT_INFO_FLAG_CHAINLOAD_READ_OK) == 0u) {
             write_string(row, 16u, 0x4F, "target boot sector read failed");
+        } else if (bytes_match((const u8 *)boot_plan->request_label, (const u8 *)"Linux", 5u) &&
+                   linux_ext_superblock_is_valid(boot_info)) {
+            write_string(row, 16u, 0x1E, "ext superblock found, needs file loader");
         } else if (read_le_u16((const u8 *)CHAINLOAD_BUFFER_ADDR + 510u) != 0xAA55u) {
-            write_string(row, 16u, 0x4F, "target sector is not bootable");
+            if (entry == 0) {
+                write_string(row, 16u, 0x4F, "target sector is not bootable");
+            } else {
+                target_sector = (const u8 *)CHAINLOAD_BUFFER_ADDR;
+                kind = detect_vbr_kind(target_sector);
+                write_string(row, 16u, 0x4F, partition_vbr_fit_label(entry->partition_type, kind));
+            }
         } else {
-            write_string(row, 16u, 0x1E, "MBR path looked bootable");
+            if (entry == 0) {
+                write_string(row, 16u, 0x1E, "MBR path looked bootable");
+            } else {
+                target_sector = (const u8 *)CHAINLOAD_BUFFER_ADDR;
+                kind = detect_vbr_kind(target_sector);
+                write_string(row, 16u, 0x1E, partition_vbr_fit_label(entry->partition_type, kind));
+            }
         }
         return;
     }
@@ -438,9 +951,9 @@ static void write_fallback_reason_line(u32 row,
 static void write_selected_mbr_line(u32 row,
                                     const BootInfo *boot_info,
                                     const BootPlan *boot_plan) {
-    const u8 *mbr;
     const MbrPartitionEntry *entry;
     u32 sector_count;
+    u32 block_size;
 
     write_string(row, 4u, 0x1F, "Chosen MBR:");
 
@@ -449,34 +962,41 @@ static void write_selected_mbr_line(u32 row,
         return;
     }
 
-    if ((boot_info->inspection_flags & BOOT_INFO_FLAG_MBR_VALID) == 0u) {
+    entry = selected_mbr_entry(boot_info, boot_plan);
+    if (entry == 0) {
         write_string(row, 16u, 0x4F, "sector 0 unavailable");
         return;
     }
-
-    if (boot_plan->candidate.partition_number >= 4u) {
-        write_string(row, 16u, 0x4F, "candidate slot out of range");
-        return;
-    }
-
-    mbr = (const u8 *)MBR_SECTOR_ADDR;
-    entry = (const MbrPartitionEntry *)(mbr + PARTITION_ENTRY_OFFSET +
-                                        boot_plan->candidate.partition_number *
-                                            PARTITION_ENTRY_SIZE);
     sector_count = read_le_u32(entry->sector_count);
 
-    write_string(row, 16u, 0x1E, "part ");
-    VGA_TEXT_BUFFER[row * VGA_COLUMNS + 21u] =
+    write_string(row, 16u, 0x1E, "p");
+    VGA_TEXT_BUFFER[row * VGA_COLUMNS + 17u] =
         make_vga_cell((char)('1' + boot_plan->candidate.partition_number), 0x1E);
-    write_string(row, 23u, 0x1F, "active ");
-    VGA_TEXT_BUFFER[row * VGA_COLUMNS + 30u] =
+    write_string(row, 19u, 0x1F, "A");
+    VGA_TEXT_BUFFER[row * VGA_COLUMNS + 20u] =
         make_vga_cell(entry->boot_indicator == 0x80u ? 'Y' : 'N', 0x1E);
-    write_string(row, 32u, 0x1F, "type 0x");
-    write_hex_byte(row, 40u, 0x1E, entry->partition_type);
-    write_string(row, 43u, 0x1F, "start 0x");
-    write_hex_u32(row, 51u, 0x1E, read_le_u32(entry->start_lba));
-    write_string(row, 60u, 0x1F, "size 0x");
-    write_hex_u32(row, 67u, 0x1E, sector_count);
+    write_string(row, 22u, 0x1F, "t");
+    write_hex_byte(row, 23u, 0x1E, entry->partition_type);
+    write_string(row, 26u, 0x1F, "lba");
+    write_hex_u32(row, 29u, 0x1E, read_le_u32(entry->start_lba));
+    write_string(row, 38u, 0x1F, "sz");
+    write_hex_u32(row, 40u, 0x1E, sector_count);
+
+    if (bytes_match((const u8 *)boot_plan->request_label, (const u8 *)"Linux", 5u) &&
+        linux_layout_probe_is_available(boot_info)) {
+        if (linux_ext_superblock_is_valid(boot_info)) {
+            block_size = linux_ext_block_size(boot_info);
+            write_string(row, 49u, 0x1F, "ext");
+            write_hex_byte(row, 52u, 0x1E, 0xEFu);
+            write_hex_byte(row, 54u, 0x1E, 0x53u);
+            if (block_size != 0u) {
+                write_string(row, 57u, 0x1F, "blk");
+                write_hex_u32(row, 60u, 0x1E, block_size);
+            }
+        } else {
+            write_string(row, 49u, 0x4F, "no ext magic");
+        }
+    }
 }
 
 static void identify_targets(const BootInfo *boot_info,
@@ -604,6 +1124,82 @@ static void inspect_gpt_header(const BootInfo *boot_info) {
     write_string(21u, 15u, 0x4F, "not a GPT header");
 }
 
+static void inspect_linux_layout(const BootInfo *boot_info, const BootPlan *boot_plan) {
+    u32 block_size;
+    u32 inode_size;
+    u32 blocks_per_group;
+    u32 inodes_per_group;
+    u32 gdt_lba;
+    u32 incompat_features;
+    u32 block_bitmap_block;
+    u32 inode_bitmap_block;
+    u32 inode_table_block;
+    u32 root_inode_lba;
+
+    write_string(21u, 4u, 0x1F, "Linux probe:");
+
+    if (!linux_layout_probe_is_available(boot_info)) {
+        write_string(21u, 17u, 0x4F, "not collected on this path");
+        return;
+    }
+
+    if (!linux_ext_superblock_is_valid(boot_info)) {
+        write_string(21u, 17u, 0x4F, "no ext superblock magic");
+        return;
+    }
+
+    block_size = linux_ext_block_size(boot_info);
+    inode_size = linux_ext_inode_size(boot_info);
+    blocks_per_group = linux_ext_blocks_per_group(boot_info);
+    inodes_per_group = linux_ext_inodes_per_group(boot_info);
+    gdt_lba = linux_ext_gdt_lba(boot_plan, boot_info);
+    incompat_features = linux_ext_incompat_features(boot_info);
+
+    write_string(21u, 17u, 0x1E, "ext rev 0x");
+    write_hex_u32(21u, 27u, 0x1E, linux_ext_revision(boot_info));
+    write_string(21u, 36u, 0x1F, "blk");
+    write_hex_u32(21u, 39u, 0x1E, block_size);
+    write_string(21u, 48u, 0x1F, "ino");
+    write_hex_u32(21u, 51u, 0x1E, inode_size);
+
+    write_string(22u, 4u, 0x1F, "Volume:");
+    write_trimmed_ascii(22u, 13u, 0x1E, (const u8 *)GPT_ENTRY_SECTOR_ADDR + 120u, 16u);
+
+    write_string(23u, 4u, 0x1F, "Groups:");
+    write_string(23u, 13u, 0x1F, "blk/grp");
+    write_hex_u32(23u, 20u, 0x1E, blocks_per_group);
+    write_string(23u, 29u, 0x1F, "ino/grp");
+    write_hex_u32(23u, 36u, 0x1E, inodes_per_group);
+    write_string(23u, 45u, 0x1F, "fd");
+    write_hex_u32(23u, 47u, 0x1E, linux_ext_first_data_block(boot_info));
+
+    write_string(24u, 4u, 0x1F, "Next ext:");
+    if (!linux_ext_gdt_probe_is_available(boot_info)) {
+        write_string(24u, 14u, 0x1F, "GDT LBA 0x");
+        write_hex_u32(24u, 24u, 0x1E, gdt_lba);
+        write_string(24u, 33u, 0x4F, "needs blk>=4K follow-up read");
+        return;
+    }
+
+    block_bitmap_block = linux_ext_group_desc_field(boot_info, 0u);
+    inode_bitmap_block = linux_ext_group_desc_field(boot_info, 4u);
+    inode_table_block = linux_ext_group_desc_field(boot_info, 8u);
+    root_inode_lba = linux_ext_root_inode_lba(boot_plan, boot_info);
+
+    write_string(24u, 14u, 0x1F, "bb");
+    write_hex_u32(24u, 16u, 0x1E, block_bitmap_block);
+    write_string(24u, 25u, 0x1F, "ib");
+    write_hex_u32(24u, 27u, 0x1E, inode_bitmap_block);
+    write_string(24u, 36u, 0x1F, "it");
+    write_hex_u32(24u, 38u, 0x1E, inode_table_block);
+    write_string(24u, 47u, 0x1F, "rLBA");
+    write_hex_u32(24u, 51u, 0x1E, root_inode_lba);
+    VGA_TEXT_BUFFER[24u * VGA_COLUMNS + 60u] = make_vga_cell('+', 0x1F);
+    write_hex_u32(24u, 61u, 0x1E, linux_ext_root_inode_offset(boot_info));
+    write_string(24u, 70u, 0x1F, "if");
+    write_hex_u32(24u, 72u, 0x1E, incompat_features);
+}
+
 static void inspect_gpt_entries(const BootInfo *boot_info) {
     const u8 *gpt_header;
     const u8 *gpt_entries;
@@ -670,6 +1266,7 @@ void boot_menu_main(void) {
 
     make_boot_plan(boot_info->selected_target, &linux_candidate, &windows_candidate,
                    &boot_plan);
+    refine_boot_plan_with_linux_probe(boot_info, &boot_plan);
     write_target_vbr_line(7u, boot_info, &boot_plan);
     write_selected_mbr_line(9u, boot_info, &boot_plan);
     write_fallback_reason_line(12u, boot_info, &boot_plan);
@@ -678,6 +1275,10 @@ void boot_menu_main(void) {
     write_boot_support_line(15u, &boot_plan);
 
     inspect_mbr(boot_info);
-    inspect_gpt_header(boot_info);
-    inspect_gpt_entries(boot_info);
+    if (linux_layout_probe_is_available(boot_info)) {
+        inspect_linux_layout(boot_info, &boot_plan);
+    } else {
+        inspect_gpt_header(boot_info);
+        inspect_gpt_entries(boot_info);
+    }
 }
