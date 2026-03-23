@@ -10,8 +10,17 @@ DATA_SELECTOR equ 0x10
 MENU_LOAD_SEG equ 0x1000
 MENU_LOAD_ADDR equ 0x10000
 BOOT_INFO_ADDR equ 0x0500
+MBR_SECTOR_ADDR equ 0x0600
+GPT_HEADER_ADDR equ 0x0800
+GPT_ENTRY_SECTOR_ADDR equ 0x0A00
+CHAINLOAD_BUFFER_ADDR equ 0x7E00
 BOOT_TARGET_LINUX equ 0x01
 BOOT_TARGET_WINDOWS equ 0x02
+BOOT_INFO_FLAG_MBR_VALID equ 0x01
+BOOT_INFO_FLAG_GPT_HEADER_VALID equ 0x02
+BOOT_INFO_FLAG_GPT_ENTRY_VALID equ 0x04
+BOOT_INFO_FLAG_CHAINLOAD_MATCH equ 0x08
+BOOT_INFO_FLAG_CHAINLOAD_READ_OK equ 0x10
 
 start:
     cli
@@ -29,36 +38,18 @@ start:
 main_menu:
     call clear_screen
 
-    mov si, title_msg
-    call print_string
-    mov si, intro_msg
-    call print_string
-    mov si, drive_msg
-    call print_string
-    mov al, [boot_drive]
-    call print_hex_byte
     mov si, menu_msg
     call print_string
 
 .wait_for_key:
     xor ah, ah
     int 0x16
+    and al, 11011111b
 
     cmp al, 'L'
     je linux_selected
-    cmp al, 'l'
-    je linux_selected
     cmp al, 'W'
     je windows_selected
-    cmp al, 'w'
-    je windows_selected
-    cmp al, 'R'
-    je reboot_selected
-    cmp al, 'r'
-    je reboot_selected
-
-    mov si, invalid_msg
-    call print_string
     jmp .wait_for_key
 
 linux_selected:
@@ -70,22 +61,110 @@ windows_selected:
     jmp start_menu_loader
 
 start_menu_loader:
+    call inspect_boot_disk
+    call try_mbr_chainload
     call write_boot_info
-    mov si, loading_msg
-    call print_string
     call load_menu_loader
     jmp enter_protected_mode
 
-reboot_selected:
-    int 0x19
-
 load_menu_loader:
     ; Use INT 13h extensions so we can read by LBA instead of older CHS math.
+    mov si, menu_loader_dap
+    call read_with_dap
+    jc disk_error
+    ret
+
+inspect_boot_disk:
+    mov byte [inspection_flags], 0
+
+    mov si, mbr_sector_dap
+    call read_with_dap
+    jc .skip_mbr
+    or byte [inspection_flags], BOOT_INFO_FLAG_MBR_VALID
+
+.skip_mbr:
+    mov si, gpt_header_dap
+    call read_with_dap
+    jc .done
+    or byte [inspection_flags], BOOT_INFO_FLAG_GPT_HEADER_VALID
+
+    mov si, gpt_entry_dap
+    call read_with_dap
+    jc .done
+    or byte [inspection_flags], BOOT_INFO_FLAG_GPT_ENTRY_VALID
+
+.done:
+    ret
+
+try_mbr_chainload:
+    test byte [inspection_flags], BOOT_INFO_FLAG_MBR_VALID
+    jz .no_match
+
+    cmp word [MBR_SECTOR_ADDR + 510], 0xAA55
+    jne .no_match
+
+    mov si, MBR_SECTOR_ADDR + 446
+    mov cx, 4
+
+.find_candidate:
+    mov al, [selected_target]
+    cmp al, BOOT_TARGET_LINUX
+    je .check_linux
+
+    cmp byte [si + 4], 0x07
+    je .candidate_found
+    cmp byte [si + 4], 0x0B
+    je .candidate_found
+    cmp byte [si + 4], 0x0C
+    je .candidate_found
+    jmp .next_partition
+
+.check_linux:
+    cmp byte [si + 4], 0x83
+    je .candidate_found
+
+.next_partition:
+    add si, 16
+    loop .find_candidate
+
+.no_match:
+    ret
+
+.candidate_found:
+    or byte [inspection_flags], BOOT_INFO_FLAG_CHAINLOAD_MATCH
+
+    ; Reuse this DAP slot as temporary scratch space for chainloading.
+    mov word [gpt_entry_dap + 4], CHAINLOAD_BUFFER_ADDR
+
+    mov ax, [si + 8]
+    mov [gpt_entry_dap + 8], ax
+    mov ax, [si + 10]
+    mov [gpt_entry_dap + 10], ax
+    xor ax, ax
+    mov [gpt_entry_dap + 12], ax
+    mov [gpt_entry_dap + 14], ax
+
+    mov si, gpt_entry_dap
+    call read_with_dap
+    jc .no_match
+    or byte [inspection_flags], BOOT_INFO_FLAG_CHAINLOAD_READ_OK
+
+    cmp word [CHAINLOAD_BUFFER_ADDR + 510], 0xAA55
+    jne .no_match
+
+    mov si, CHAINLOAD_BUFFER_ADDR
+    mov di, 0x7C00
+    mov cx, 256
+    rep movsw
+
+    mov dl, [boot_drive]
+    mov sp, 0x7C00
+    jmp 0x0000:0x7C00
+
+read_with_dap:
     mov ah, 0x42
     mov dl, [boot_drive]
-    mov si, disk_address_packet
     int 0x13
-    jc disk_error
     ret
 
 enter_protected_mode:
@@ -108,10 +187,8 @@ enable_a20:
 write_boot_info:
     ; Stage 2 reads this structure from low memory so it knows what the
     ; user picked in the BIOS menu and which drive booted the loader.
-    mov byte [BOOT_INFO_ADDR + 0], 'S'
-    mov byte [BOOT_INFO_ADDR + 1], 'B'
-    mov byte [BOOT_INFO_ADDR + 2], 'I'
-    mov byte [BOOT_INFO_ADDR + 3], '1'
+    mov word [BOOT_INFO_ADDR + 0], 0x4253
+    mov word [BOOT_INFO_ADDR + 2], 0x3149
     mov byte [BOOT_INFO_ADDR + 4], 1
 
     mov al, [selected_target]
@@ -119,13 +196,12 @@ write_boot_info:
 
     mov al, [boot_drive]
     mov byte [BOOT_INFO_ADDR + 6], al
-    mov byte [BOOT_INFO_ADDR + 7], 0
+
+    mov al, [inspection_flags]
+    mov byte [BOOT_INFO_ADDR + 7], al
     ret
 
 disk_error:
-    mov si, disk_error_msg
-    call print_string
-
 .hang:
     cli
     hlt
@@ -151,49 +227,13 @@ print_string:
 .done:
     ret
 
-print_hex_byte:
-    push ax
-
-    mov ah, al
-    shr al, 4
-    call print_hex_nibble
-
-    mov al, ah
-    and al, 0x0F
-    call print_hex_nibble
-
-    pop ax
-    ret
-
-print_hex_nibble:
-    and al, 0x0F
-    cmp al, 9
-    jbe .digit
-    add al, 'A' - 10
-    jmp .emit
-
-.digit:
-    add al, '0'
-
-.emit:
-    mov ah, 0x0E
-    mov bh, 0x00
-    mov bl, 0x07
-    int 0x10
-    ret
-
-title_msg db "Soul Boot", 0x0D, 0x0A, 0
-intro_msg db "L/W -> menu loader", 0x0D, 0x0A, 0
-drive_msg db "DL=0x", 0
-menu_msg db 0x0D, 0x0A, "[L] Linux", 0x0D, 0x0A, "[W] Windows", 0x0D, 0x0A, "[R] Reboot", 0x0D, 0x0A, "> ", 0
-invalid_msg db 0x0D, 0x0A, "Use L, W, or R.", 0
-loading_msg db 0x0D, 0x0A, "Loading menu loader...", 0
-disk_error_msg db 0x0D, 0x0A, "Disk read failed.", 0
+menu_msg db "L/W> ", 0
 boot_drive db 0
 selected_target db 0
+inspection_flags db 0
 
 align 4
-disk_address_packet:
+menu_loader_dap:
     db 0x10
     db 0x00
     dw MENU_LOADER_SECTORS
@@ -201,7 +241,31 @@ disk_address_packet:
     dw MENU_LOAD_SEG
     dq 0x0000000000000001
 
-align 8
+mbr_sector_dap:
+    db 0x10
+    db 0x00
+    dw 1
+    dw MBR_SECTOR_ADDR
+    dw 0x0000
+    dq 0x0000000000000000
+
+gpt_header_dap:
+    db 0x10
+    db 0x00
+    dw 1
+    dw GPT_HEADER_ADDR
+    dw 0x0000
+    dq 0x0000000000000001
+
+gpt_entry_dap:
+    db 0x10
+    db 0x00
+    dw 1
+    dw GPT_ENTRY_SECTOR_ADDR
+    dw 0x0000
+    dq 0x0000000000000002
+
+align 4
 gdt_start:
     dq 0
     dq 0x00CF9A000000FFFF
